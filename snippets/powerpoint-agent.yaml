@@ -1,0 +1,185 @@
+name: PowerPoint Agent Client
+description: Connects PowerPoint to the local Office Agent Server via WebSocket
+host: POWERPOINT
+api_set: {}
+script:
+  language: typescript
+  content: |
+    const SERVER = "ws://localhost:3579/ws";
+    const SESSION_KEY = "agent_session_id_ppt";
+
+    let ws: WebSocket | null = null;
+    let sessionId: string = localStorage.getItem(SESSION_KEY) || "";
+
+    // ── Connect ──────────────────────────────────────────────────────────────
+    function connect(): Promise<void> {
+      return new Promise((resolve, reject) => {
+        ws = new WebSocket(SERVER);
+
+        ws.onopen = () => {
+          ws!.send(JSON.stringify({
+            type: "register",
+            app: "powerpoint",
+            sessionId: sessionId || undefined,
+            meta: {}
+          }));
+        };
+
+        ws.onmessage = async (ev) => {
+          const msg = JSON.parse(ev.data);
+
+          if (msg.type === "registered") {
+            sessionId = msg.sessionId;
+            localStorage.setItem(SESSION_KEY, sessionId);
+            appendLog(`Connected — session: ${sessionId}`, "info");
+            resolve();
+            return;
+          }
+
+          if (msg.type === "message") {
+            appendLog(`Agent: ${msg.content}`, "agent");
+            return;
+          }
+
+          if (msg.type === "execute") {
+            appendLog(`Executing code (target: ${msg.target})…`, "info");
+            try {
+              const fn = new Function(`return (async () => { ${msg.code} })()`);
+              const result = await fn();
+              appendLog("Execution succeeded.", "success");
+              ws!.send(JSON.stringify({ type: "result", success: true, output: String(result ?? "") }));
+            } catch (err: any) {
+              appendLog(`Execution error: ${err.message}`, "error");
+              ws!.send(JSON.stringify({ type: "result", success: false, output: err.message }));
+            }
+            return;
+          }
+
+          if (msg.type === "error") {
+            appendLog(`Server error: ${msg.content}`, "error");
+          }
+        };
+
+        ws.onerror = () => {
+          appendLog("WebSocket error. Is the server running?", "error");
+          reject(new Error("WebSocket error"));
+        };
+
+        ws.onclose = () => {
+          appendLog("Disconnected. Reconnecting in 3s…", "info");
+          setTimeout(() => connect(), 3000);
+        };
+      });
+    }
+
+    // ── Send message ─────────────────────────────────────────────────────────
+    async function sendMessage(text: string) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        appendLog("Not connected.", "error");
+        return;
+      }
+
+      const context = await gatherContext();
+      appendLog(`You: ${text}`, "user");
+
+      ws.send(JSON.stringify({
+        type: "message",
+        id: crypto.randomUUID(),
+        app: "powerpoint",
+        content: text,
+        context
+      }));
+    }
+
+    async function gatherContext() {
+      try {
+        return await PowerPoint.run(async (ctx) => {
+          const pres = ctx.presentation;
+          pres.load("title");
+          const slides = pres.slides;
+          slides.load("items/id");
+          await ctx.sync();
+          return {
+            presentationTitle: pres.title,
+            slideCount: slides.items.length
+          };
+        });
+      } catch {
+        return {};
+      }
+    }
+
+    // ── UI helpers ────────────────────────────────────────────────────────────
+    function appendLog(text: string, type: "user" | "agent" | "info" | "error" | "success") {
+      const log = document.getElementById("log")!;
+      const p = document.createElement("p");
+      p.className = type;
+      p.textContent = text;
+      log.appendChild(p);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    // ── Bootstrap ────────────────────────────────────────────────────────────
+    Office.onReady(async () => {
+      document.getElementById("send-btn")!.onclick = () => {
+        const input = document.getElementById("msg-input") as HTMLInputElement;
+        const text = input.value.trim();
+        if (text) { sendMessage(text); input.value = ""; }
+      };
+
+      document.getElementById("msg-input")!.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          (document.getElementById("send-btn") as HTMLButtonElement).click();
+          e.preventDefault();
+        }
+      });
+
+      document.getElementById("clear-btn")!.onclick = () => {
+        document.getElementById("log")!.innerHTML = "";
+        sessionId = "";
+        localStorage.removeItem(SESSION_KEY);
+        appendLog("Session cleared.", "info");
+      };
+
+      appendLog("Connecting to agent server…", "info");
+      try {
+        await connect();
+      } catch {
+        appendLog("Could not connect. Start the server and refresh.", "error");
+      }
+    });
+
+template:
+  language: html
+  content: |
+    <div id="app">
+      <div id="log"></div>
+      <div id="input-row">
+        <input id="msg-input" type="text" placeholder="Ask the agent…" autocomplete="off" />
+        <button id="send-btn">Send</button>
+        <button id="clear-btn" title="Clear session">↺</button>
+      </div>
+    </div>
+
+style:
+  language: css
+  content: |
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: Segoe UI, sans-serif; font-size: 13px; }
+    #app { display: flex; flex-direction: column; height: 100vh; background: #f5f5f5; }
+    #log { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+    #log p { padding: 6px 10px; border-radius: 6px; max-width: 90%; word-break: break-word; }
+    #log p.user    { background: #b7472a; color: #fff; align-self: flex-end; }
+    #log p.agent   { background: #fff; border: 1px solid #ddd; align-self: flex-start; }
+    #log p.info    { background: transparent; color: #888; font-size: 11px; align-self: center; }
+    #log p.error   { background: #fde; color: #c00; align-self: flex-start; }
+    #log p.success { background: #dfd; color: #060; align-self: flex-start; }
+    #input-row { display: flex; gap: 4px; padding: 8px; background: #fff; border-top: 1px solid #ddd; }
+    #msg-input { flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; }
+    button { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; background: #b7472a; color: #fff; }
+    button:hover { background: #8c3520; }
+    #clear-btn { background: #eee; color: #333; }
+    #clear-btn:hover { background: #ddd; }
+
+libraries: |
+  https://appsforoffice.microsoft.com/lib/1/hosted/office.js
+  @types/office-js

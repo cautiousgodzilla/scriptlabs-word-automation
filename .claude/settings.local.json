@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(LLM_PROVIDER=anthropic LLM_API_KEY=test LLM_MODEL=claude-sonnet-4-6 timeout 3 node index.js)",
+      "Bash(node --input-type=module)",
+      "Bash(LLM_PROVIDER=anthropic LLM_API_KEY=test LLM_MODEL=claude-sonnet-4-6 timeout 4 node index.js)",
+      "Bash(LLM_PROVIDER=anthropic LLM_API_KEY=test LLM_MODEL=claude-sonnet-4-6 PORT=3580 timeout 4 node index.js)",
+      "Bash(LLM_PROVIDER=anthropic LLM_API_KEY=test LLM_MODEL=claude-sonnet-4-6 PORT=3581 timeout 4 node index.js)",
+      "Bash(LLM_PROVIDER=anthropic LLM_API_KEY=test LLM_MODEL=claude-sonnet-4-6 PORT=3582 timeout 4 node index.js)"
+    ]
+  }
+}

@@ -1,0 +1,537 @@
+name: Word Agent Client
+description: Connects Word to the local Office Agent Server with workflow support
+host: WORD
+api_set: {}
+script:
+  language: typescript
+  content: |
+    const SERVER = "ws://localhost:3579/ws";
+    const SESSION_KEY = "agent_session_id";
+
+    // Maps /command-name → workflow { id, title }
+    const SLASH_COMMANDS: Record<string, { id: string; title: string }> = {
+      "generate-flowchart": { id: "builtin-flowchart-from-steps", title: "Generate flowchart" },
+      "proofread":          { id: "builtin-proofread-document",   title: "Proofread document" },
+    };
+
+    // "selection" → selection only (1 000 chars)
+    // "body"      → selection + bodyText fallback (2 000 chars)
+    // "full"      → selection + bodyText + fullBody (12 000 chars)
+    type ContextScope = "selection" | "body" | "full";
+    const WORKFLOW_CONTEXT_SCOPE: Record<string, ContextScope> = {
+      "builtin-proofread-document":   "full",
+      "builtin-flowchart-from-steps": "body",
+    };
+
+    let ws: WebSocket | null = null;
+    let sessionId: string = localStorage.getItem(SESSION_KEY) || "";
+    let pendingResolvers = new Map<string, (v: any) => void>();
+    let selectedWorkflow: { id: string; title: string } | null = null;
+    let workflowsCache: Array<{
+      id: string; title: string; practice?: string; is_system: boolean;
+      hidden?: boolean; prompt_md?: string; prompt_md_preview?: string;
+    }> = [];
+    let editingWorkflowId: string | null = null;
+
+    // ── WebSocket request helper (correlates replies by id) ───────────────────
+    function wsRequest<T>(payload: object): Promise<T> {
+      const id = crypto.randomUUID();
+      return new Promise((resolve, reject) => {
+        pendingResolvers.set(id, resolve as (v: any) => void);
+        setTimeout(() => {
+          if (pendingResolvers.has(id)) {
+            pendingResolvers.delete(id);
+            reject(new Error("Request timed out"));
+          }
+        }, 10000);
+        ws!.send(JSON.stringify({ id, ...payload }));
+      });
+    }
+
+    // ── Connect ───────────────────────────────────────────────────────────────
+    function connect(): Promise<void> {
+      return new Promise((resolve, reject) => {
+        ws = new WebSocket(SERVER);
+
+        ws.onopen = () => {
+          ws!.send(JSON.stringify({
+            type: "register",
+            app: "word",
+            sessionId: sessionId || undefined,
+            meta: { documentTitle: Office.context.document?.url ?? "" }
+          }));
+        };
+
+        ws.onmessage = async (ev) => {
+          const msg = JSON.parse(ev.data);
+
+          if (msg.type === "registered") {
+            sessionId = msg.sessionId;
+            localStorage.setItem(SESSION_KEY, sessionId);
+            appendLog(`Connected — session: ${sessionId}`, "info");
+            resolve();
+            return;
+          }
+
+          // Route all replies with an id through pendingResolvers
+          if (msg.id && pendingResolvers.has(msg.id)) {
+            const resolver = pendingResolvers.get(msg.id)!;
+            pendingResolvers.delete(msg.id);
+            resolver(msg);
+            return;
+          }
+
+          if (msg.type === "message") {
+            appendLog(`Agent: ${msg.content}`, "agent");
+            return;
+          }
+
+          if (msg.type === "workflow_applied") {
+            appendLog(`Workflow applied: ${msg.title}`, "info");
+            return;
+          }
+
+          if (msg.type === "execute") {
+            appendLog(`Executing code (target: ${msg.target})…`, "info");
+            try {
+              const fn = new Function(`return (async () => { ${msg.code} })()`);
+              const result = await fn();
+              appendLog("Execution succeeded.", "success");
+              ws!.send(JSON.stringify({ type: "result", success: true, output: String(result ?? "") }));
+            } catch (err: any) {
+              appendLog(`Execution error: ${err.message}`, "error");
+              ws!.send(JSON.stringify({ type: "result", success: false, output: err.message }));
+            }
+            return;
+          }
+
+          if (msg.type === "error") {
+            appendLog(`Server error: ${msg.content}`, "error");
+          }
+        };
+
+        ws.onerror = () => {
+          appendLog("WebSocket error. Is the server running?", "error");
+          reject(new Error("WebSocket error"));
+        };
+
+        ws.onclose = () => {
+          appendLog("Disconnected. Reconnecting in 3s…", "info");
+          setTimeout(() => connect(), 3000);
+        };
+      });
+    }
+
+    // ── Slash command parser ──────────────────────────────────────────────────
+    function parseSlashCommand(raw: string): { workflow: { id: string; title: string } | null; message: string } {
+      if (!raw.startsWith("/")) return { workflow: null, message: raw };
+      const spaceIdx = raw.indexOf(" ");
+      const command = (spaceIdx === -1 ? raw.slice(1) : raw.slice(1, spaceIdx)).toLowerCase();
+      const rest = spaceIdx === -1 ? "" : raw.slice(spaceIdx + 1).trim();
+      const wf = SLASH_COMMANDS[command];
+      if (!wf) return { workflow: null, message: raw }; // unknown command — pass through as text
+      const defaultMessages: Record<string, string> = {
+        "generate-flowchart": "Generate flowchart from the document.",
+        "proofread": "Proofread the document.",
+      };
+      return { workflow: wf, message: rest || defaultMessages[command] || `Run the ${command} workflow.` };
+    }
+
+    // ── Send message ──────────────────────────────────────────────────────────
+    async function sendMessage(rawText: string) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        appendLog("Not connected.", "error");
+        return;
+      }
+
+      const { workflow: slashWorkflow, message: text } = parseSlashCommand(rawText);
+      const effectiveWorkflow = slashWorkflow ?? selectedWorkflow;
+
+      const id = crypto.randomUUID();
+      const scope: ContextScope = effectiveWorkflow
+        ? (WORKFLOW_CONTEXT_SCOPE[effectiveWorkflow.id] ?? "selection")
+        : "selection";
+      const context = await gatherContext(scope);
+      const wfLabel = effectiveWorkflow ? ` [via ${effectiveWorkflow.title}]` : "";
+      appendLog(`You${wfLabel}: ${text}`, "user");
+
+      ws.send(JSON.stringify({
+        type: "message",
+        id,
+        app: "word",
+        content: text,
+        context,
+        workflow: effectiveWorkflow ?? undefined,
+      }));
+
+      selectedWorkflow = null;
+      renderWorkflowChip();
+    }
+
+    async function gatherContext(scope: ContextScope = "selection") {
+      try {
+        return await Word.run(async (ctx) => {
+          const sel = ctx.document.getSelection();
+          sel.load("text");
+          const props = ctx.document.properties;
+          props.load("title");
+          const needsBody = scope === "body" || scope === "full";
+          const body = needsBody ? ctx.document.body : null;
+          if (body) body.load("text");
+          await ctx.sync();
+
+          const selText = sel.text.trim();
+          const result: Record<string, string> = {
+            documentTitle: props.title,
+            selection: selText.slice(0, 1000),
+          };
+
+          if (needsBody) {
+            const bodyFull = body!.text;
+            result.bodyText = selText ? "" : bodyFull.slice(0, 2000);
+            if (scope === "full") {
+              result.fullBody = bodyFull.slice(0, 12000);
+            }
+          }
+
+          return result;
+        });
+      } catch {
+        return {};
+      }
+    }
+
+    // ── Workflow chip ─────────────────────────────────────────────────────────
+    function renderWorkflowChip() {
+      const chip = document.getElementById("wf-chip")!;
+      const chipTitle = document.getElementById("wf-chip-title")!;
+      if (selectedWorkflow) {
+        chipTitle.textContent = selectedWorkflow.title;
+        (chip as HTMLElement).hidden = false;
+      } else {
+        (chip as HTMLElement).hidden = true;
+      }
+    }
+
+    // ── Picker modal ──────────────────────────────────────────────────────────
+    async function openPickerModal() {
+      (document.getElementById("wf-picker-modal") as HTMLElement).hidden = false;
+      const listEl = document.getElementById("wf-list")!;
+      listEl.innerHTML = "<li class='muted'>Loading…</li>";
+      try {
+        const reply = await wsRequest<any>({ type: "workflow.list" });
+        workflowsCache = reply.workflows ?? [];
+        renderPickerList();
+      } catch {
+        listEl.innerHTML = "<li class='muted err'>Failed to load workflows</li>";
+      }
+    }
+
+    function renderPickerList() {
+      const listEl = document.getElementById("wf-list")!;
+      const q = (document.getElementById("wf-search") as HTMLInputElement).value.toLowerCase();
+      const items = workflowsCache.filter(w => !w.hidden && w.title.toLowerCase().includes(q));
+      if (!items.length) { listEl.innerHTML = "<li class='muted'>No workflows found</li>"; return; }
+      listEl.innerHTML = "";
+      for (const w of items) {
+        const li = document.createElement("li");
+        li.innerHTML =
+          `<div><strong>${esc(w.title)}</strong>${w.practice ? ` <span class="tag">${esc(w.practice)}</span>` : ""}</div>` +
+          (w.prompt_md_preview ? `<div class="preview">${esc(w.prompt_md_preview.slice(0, 120))}</div>` : "");
+        li.onclick = () => {
+          selectedWorkflow = { id: w.id, title: w.title };
+          renderWorkflowChip();
+          closeModal("wf-picker-modal");
+        };
+        listEl.appendChild(li);
+      }
+    }
+
+    // ── Manage modal ──────────────────────────────────────────────────────────
+    async function openManageModal() {
+      (document.getElementById("wf-manage-modal") as HTMLElement).hidden = false;
+      hideEditor();
+      await refreshManageList();
+    }
+
+    async function refreshManageList() {
+      const listEl = document.getElementById("wf-manage-list")!;
+      listEl.innerHTML = "<li class='muted'>Loading…</li>";
+      try {
+        const reply = await wsRequest<any>({ type: "workflow.list", includeHidden: true });
+        workflowsCache = reply.workflows ?? [];
+        renderManageList();
+      } catch {
+        listEl.innerHTML = "<li class='muted err'>Failed to load</li>";
+      }
+    }
+
+    function renderManageList() {
+      const listEl = document.getElementById("wf-manage-list")!;
+      listEl.innerHTML = "";
+      for (const w of workflowsCache) {
+        const li = document.createElement("li");
+        li.className = "manage-row";
+
+        const info = document.createElement("span");
+        info.innerHTML = `<strong>${esc(w.title)}</strong>${w.is_system ? " <em class='tag'>built-in</em>" : ""}`;
+        li.appendChild(info);
+
+        const acts = document.createElement("span");
+        acts.className = "row-actions";
+
+        if (!w.is_system) {
+          const editBtn = btn("Edit", () => showEditor(w));
+          const delBtn = btn("Delete", async () => {
+            if (!confirm(`Delete "${w.title}"?`)) return;
+            await wsRequest({ type: "workflow.delete", workflow_id: w.id });
+            await refreshManageList();
+          }, "#c00");
+          acts.appendChild(editBtn);
+          acts.appendChild(delBtn);
+        } else {
+          const toggleBtn = btn(w.hidden ? "Unhide" : "Hide", async () => {
+            await wsRequest({ type: w.hidden ? "workflow.unhide" : "workflow.hide", workflow_id: w.id });
+            await refreshManageList();
+          });
+          acts.appendChild(toggleBtn);
+        }
+
+        li.appendChild(acts);
+        listEl.appendChild(li);
+      }
+    }
+
+    function showEditor(w?: any) {
+      editingWorkflowId = w?.id ?? null;
+      (document.getElementById("wf-edit-title") as HTMLInputElement).value = w?.title ?? "";
+      (document.getElementById("wf-edit-practice") as HTMLInputElement).value = w?.practice ?? "";
+      (document.getElementById("wf-edit-prompt") as HTMLTextAreaElement).value = w?.prompt_md ?? "";
+      (document.getElementById("wf-editor") as HTMLElement).hidden = false;
+    }
+
+    function hideEditor() {
+      editingWorkflowId = null;
+      (document.getElementById("wf-editor") as HTMLElement).hidden = true;
+    }
+
+    async function saveWorkflow() {
+      const title = (document.getElementById("wf-edit-title") as HTMLInputElement).value.trim();
+      const practice = (document.getElementById("wf-edit-practice") as HTMLInputElement).value.trim();
+      const prompt_md = (document.getElementById("wf-edit-prompt") as HTMLTextAreaElement).value.trim();
+      if (!title || !prompt_md) { alert("Title and instructions are required."); return; }
+
+      if (editingWorkflowId) {
+        await wsRequest({ type: "workflow.update", workflow_id: editingWorkflowId, patch: { title, practice, prompt_md } });
+      } else {
+        await wsRequest({ type: "workflow.create", wfType: "assistant", title, practice, prompt_md });
+      }
+      hideEditor();
+      await refreshManageList();
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function closeModal(id: string) {
+      (document.getElementById(id) as HTMLElement).hidden = true;
+    }
+
+    function esc(s: string) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function btn(label: string, onClick: () => void, color?: string): HTMLButtonElement {
+      const b = document.createElement("button");
+      b.textContent = label;
+      if (color) b.style.background = color;
+      b.onclick = onClick;
+      return b;
+    }
+
+    function appendLog(text: string, type: "user" | "agent" | "info" | "error" | "success") {
+      const log = document.getElementById("log")!;
+      const p = document.createElement("p");
+      p.className = type;
+      p.textContent = text;
+      log.appendChild(p);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    // ── Bootstrap ─────────────────────────────────────────────────────────────
+    Office.onReady(async () => {
+      document.getElementById("send-btn")!.onclick = () => {
+        const input = document.getElementById("msg-input") as HTMLInputElement;
+        const text = input.value.trim();
+        if (text) { sendMessage(text); input.value = ""; }
+      };
+      document.getElementById("msg-input")!.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          (document.getElementById("send-btn") as HTMLButtonElement).click();
+          e.preventDefault();
+        }
+      });
+      document.getElementById("clear-btn")!.onclick = () => {
+        document.getElementById("log")!.innerHTML = "";
+        sessionId = "";
+        localStorage.removeItem(SESSION_KEY);
+        appendLog("Session cleared.", "info");
+      };
+
+      // Workflow picker
+      document.getElementById("wf-picker-btn")!.onclick = openPickerModal;
+      document.getElementById("wf-search")!.addEventListener("input", renderPickerList);
+      document.getElementById("wf-chip-clear")!.onclick = () => {
+        selectedWorkflow = null;
+        renderWorkflowChip();
+      };
+
+      // Workflow manage
+      document.getElementById("wf-manage-btn")!.onclick = openManageModal;
+      document.getElementById("wf-new-btn")!.onclick = () => showEditor();
+      document.getElementById("wf-edit-save")!.onclick = saveWorkflow;
+      document.getElementById("wf-edit-cancel")!.onclick = hideEditor;
+
+      // Close modals via × button or click-outside
+      document.querySelectorAll(".modal-close").forEach(b => {
+        b.addEventListener("click", (e) => {
+          const m = (e.target as HTMLElement).closest(".modal") as HTMLElement;
+          if (m) m.hidden = true;
+        });
+      });
+      document.querySelectorAll(".modal").forEach(m => {
+        m.addEventListener("click", (e) => {
+          if (e.target === m) (m as HTMLElement).hidden = true;
+        });
+      });
+
+      appendLog("Connecting to agent server…", "info");
+      try {
+        await connect();
+      } catch {
+        appendLog("Could not connect. Start the server and refresh.", "error");
+      }
+    });
+
+template:
+  language: html
+  content: |
+    <div id="app">
+      <div id="log"></div>
+
+      <div id="workflow-bar">
+        <button id="wf-picker-btn" title="Choose a workflow">&#128203; Workflow</button>
+        <span id="wf-chip" hidden>
+          <span id="wf-chip-title"></span>
+          <button id="wf-chip-clear" title="Remove workflow">&#215;</button>
+        </span>
+        <button id="wf-manage-btn" title="Manage workflows">&#9881;</button>
+      </div>
+
+      <div id="input-row">
+        <input id="msg-input" type="text" placeholder="Ask… or /generate-flowchart  /proofread" autocomplete="off" list="slash-suggestions" />
+        <datalist id="slash-suggestions">
+          <option value="/generate-flowchart"></option>
+          <option value="/proofread"></option>
+        </datalist>
+        <button id="send-btn">Send</button>
+        <button id="clear-btn" title="Clear session">&#8635;</button>
+      </div>
+
+      <!-- Picker modal -->
+      <div id="wf-picker-modal" class="modal" hidden>
+        <div class="modal-card">
+          <header>
+            <h3>Choose a workflow</h3>
+            <button class="modal-close">&#215;</button>
+          </header>
+          <input id="wf-search" type="text" placeholder="Search…" autocomplete="off" />
+          <ul id="wf-list"></ul>
+        </div>
+      </div>
+
+      <!-- Manage modal -->
+      <div id="wf-manage-modal" class="modal" hidden>
+        <div class="modal-card">
+          <header>
+            <h3>Manage workflows</h3>
+            <button class="modal-close">&#215;</button>
+          </header>
+          <button id="wf-new-btn">+ New workflow</button>
+          <ul id="wf-manage-list"></ul>
+          <div id="wf-editor" hidden>
+            <input id="wf-edit-title" placeholder="Title" />
+            <input id="wf-edit-practice" placeholder="Practice / category (optional)" />
+            <textarea id="wf-edit-prompt" placeholder="Prompt instructions (plain text or Markdown)…"></textarea>
+            <div class="editor-actions">
+              <button id="wf-edit-save">Save</button>
+              <button id="wf-edit-cancel">Cancel</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+style:
+  language: css
+  content: |
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: Segoe UI, sans-serif; font-size: 13px; }
+    #app { display: flex; flex-direction: column; height: 100vh; background: #f5f5f5; }
+
+    /* Chat log */
+    #log { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+    #log p { padding: 6px 10px; border-radius: 6px; max-width: 90%; word-break: break-word; }
+    #log p.user    { background: #0078d4; color: #fff; align-self: flex-end; }
+    #log p.agent   { background: #fff; border: 1px solid #ddd; align-self: flex-start; }
+    #log p.info    { background: transparent; color: #888; font-size: 11px; align-self: center; }
+    #log p.error   { background: #fde; color: #c00; align-self: flex-start; }
+    #log p.success { background: #dfd; color: #060; align-self: flex-start; }
+
+    /* Workflow bar */
+    #workflow-bar { display: flex; align-items: center; gap: 6px; padding: 5px 8px; background: #fafafa; border-top: 1px solid #eee; flex-wrap: wrap; }
+    #wf-picker-btn, #wf-manage-btn { padding: 4px 8px; background: #eef4fb; color: #0a4d8c; border: 1px solid #c8ddf0; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    #wf-picker-btn:hover, #wf-manage-btn:hover { background: #d8ecfb; }
+    #wf-chip { background: #e7f1fb; color: #0a4d8c; padding: 3px 8px 3px 8px; border-radius: 10px; font-size: 11px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid #b3d4f5; }
+    #wf-chip button { background: transparent; color: #0a4d8c; border: none; padding: 0 2px; font-size: 15px; line-height: 1; cursor: pointer; }
+
+    /* Input row */
+    #input-row { display: flex; gap: 4px; padding: 8px; background: #fff; border-top: 1px solid #ddd; }
+    #msg-input { flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; }
+    #input-row button { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; background: #0078d4; color: #fff; }
+    #input-row button:hover { background: #005a9e; }
+    #clear-btn { background: #eee; color: #333; }
+    #clear-btn:hover { background: #ddd; }
+
+    /* Modals */
+    .modal { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: flex; align-items: center; justify-content: center; z-index: 10; }
+    .modal-card { background: #fff; width: 92%; max-width: 460px; max-height: 80vh; overflow-y: auto; border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+    .modal-card header { display: flex; justify-content: space-between; align-items: center; }
+    .modal-card header h3 { font-size: 14px; font-weight: 600; }
+    .modal-close { background: transparent; border: none; font-size: 20px; cursor: pointer; color: #555; padding: 0 4px; }
+    .modal-card input, .modal-card textarea { width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+    .modal-card button { padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; background: #0078d4; color: #fff; font-size: 12px; }
+    .modal-card button:hover { background: #005a9e; }
+    #wf-new-btn { align-self: flex-start; }
+
+    /* Picker list */
+    #wf-list, #wf-manage-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
+    #wf-list li { padding: 7px 9px; border: 1px solid #e8e8e8; border-radius: 5px; cursor: pointer; }
+    #wf-list li:hover { background: #f0f7ff; border-color: #b3d4f5; }
+    .preview { color: #666; font-size: 11px; margin-top: 3px; line-height: 1.4; }
+    .tag { color: #777; font-size: 10px; background: #f0f0f0; border-radius: 3px; padding: 1px 4px; margin-left: 4px; font-style: normal; }
+    .muted { color: #888; font-size: 11px; padding: 4px; }
+    .muted.err { color: #c00; }
+
+    /* Manage list */
+    .manage-row { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 6px 4px; border-bottom: 1px solid #f0f0f0; }
+    .row-actions { display: flex; gap: 4px; flex-shrink: 0; }
+    .row-actions button { padding: 3px 8px; font-size: 11px; }
+
+    /* Editor */
+    #wf-editor { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid #eee; padding-top: 10px; }
+    #wf-edit-prompt { min-height: 120px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; resize: vertical; }
+    .editor-actions { display: flex; gap: 6px; }
+    #wf-edit-cancel { background: #eee; color: #333; }
+    #wf-edit-cancel:hover { background: #ddd; }
+
+libraries: |
+  https://appsforoffice.microsoft.com/lib/1/hosted/office.js
+  @types/office-js
